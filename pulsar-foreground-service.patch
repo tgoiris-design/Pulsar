@@ -1,0 +1,287 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 3a9b28e..9596d23 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -13,6 +13,9 @@
+     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
+     <uses-permission android:name="android.permission.BLUETOOTH"/>
+     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
++    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+     <application
+         android:name="com.ds.pulsar.Pulsar"
+         android:allowBackup="true"
+@@ -30,6 +33,10 @@
+                 <category android:name="android.intent.category.LAUNCHER" />
+             </intent-filter>
+         </activity>
++        <service
++            android:name="com.ds.pulsar.PulseService"
++            android:exported="false"
++            android:foregroundServiceType="connectedDevice" />
+     </application>
+ 
+ </manifest>
+\ No newline at end of file
+diff --git a/app/src/main/java/com/ds/pulsar/HeartRateStream.kt b/app/src/main/java/com/ds/pulsar/HeartRateStream.kt
+index fdc40f3..9892a94 100644
+--- a/app/src/main/java/com/ds/pulsar/HeartRateStream.kt
++++ b/app/src/main/java/com/ds/pulsar/HeartRateStream.kt
+@@ -20,7 +20,10 @@ val heartRateStream: HeartRateStream by lazy{
+ class HeartRateStream {
+     private var devAddres: String by PreferenceDelegate("dev_addres", "")
+     var lastScanTime: Long = 0
++    /** Incremented whenever another device is picked, so the service can reconnect. */
++    @Volatile var generation = 0
+     fun setSource( dev:  BluetoothDevice){
++        generation++
+         assert(dev.address != null)
+         devAddres = dev.address
+         this.dev = dev
+diff --git a/app/src/main/java/com/ds/pulsar/MainActivity.kt b/app/src/main/java/com/ds/pulsar/MainActivity.kt
+index a04c6cf..6fe6a38 100644
+--- a/app/src/main/java/com/ds/pulsar/MainActivity.kt
++++ b/app/src/main/java/com/ds/pulsar/MainActivity.kt
+@@ -38,6 +38,7 @@ import androidx.compose.material3.Surface
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -159,6 +160,7 @@ private fun MainUI() {
+             mutableStateOf(gotToAskAboutDisablingBt)
+         }
+         fun quit(disableBt: Boolean ){
++            PulseService.stop(activity)
+             if (disableBt)
+                 btAdapter.disable()
+             activity.finishAndRemoveTask()
+@@ -294,31 +296,14 @@ private fun MainUI() {
+             val pulse = remember{ mutableStateOf("---") }
+             val time = remember{ mutableStateOf("---") }
+             var battery by remember{ mutableStateOf("") }
+-            LaunchedEffect(null ) {
+-                while (true) {
+-                    try {
+-                        coroutineScope {
+-                            println("collecting...")
+-                            pulse.value = "---"
+-                            heartRateStream.heartRateFlow().collect {
+-                                pulse.value = it.pulse.toString()
+-                                if (it.batteryLevel != null)
+-                                    battery = it.batteryLevel.toString() + "%"
+-                            }
+-                        }
+-                    } catch (e: Exception) {
+-                        if (e is CancellationException && e !is ConnectionClosedException) {
+-                            throw e
+-                        }
+-                        if (e !is TimeoutException) {
+-                            println("Error collecting data from device: $e")
+-                            e.printStackTrace()
+-                        }
+-                    }
+-                    println("retrying to connect")
+-                    delay(200)
+-                }
++            val ctx = LocalContext.current
++            LaunchedEffect(Unit) {
++                PulseService.start(ctx)
+             }
++            val livePulse by PulseState.pulse.collectAsState()
++            val liveBattery by PulseState.battery.collectAsState()
++            LaunchedEffect(livePulse) { pulse.value = livePulse }
++            LaunchedEffect(liveBattery) { battery = liveBattery }
+             val currentSeconds = {
+                 System.currentTimeMillis() / 1000
+             }
+diff --git a/app/src/main/java/com/ds/pulsar/PulseService.kt b/app/src/main/java/com/ds/pulsar/PulseService.kt
+new file mode 100644
+index 0000000..c052274
+--- /dev/null
++++ b/app/src/main/java/com/ds/pulsar/PulseService.kt
+@@ -0,0 +1,181 @@
++package com.ds.pulsar
++
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ServiceInfo
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.Typeface
++import android.os.Build
++import android.os.IBinder
++import androidx.core.app.NotificationCompat
++import androidx.core.app.ServiceCompat
++import androidx.core.graphics.drawable.IconCompat
++import com.beepiz.bluetooth.gattcoroutines.ConnectionClosedException
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.launch
++import java.util.concurrent.TimeoutException
++
++/** Latest values, shared between the service and the UI. */
++object PulseState {
++    val pulse = MutableStateFlow("---")
++    val battery = MutableStateFlow("")
++}
++
++/**
++ * Foreground service that owns the BLE connection, so it survives
++ * switching apps, and shows the current BPM in the status bar.
++ */
++@OptIn(com.beepiz.bluetooth.gattcoroutines.ExperimentalBleGattCoroutinesCoroutinesApi::class)
++class PulseService : Service() {
++
++    companion object {
++        const val ACTION_STOP = "ds.pulsar.STOP"
++        private const val CHANNEL_ID = "pulse"
++        private const val NOTIF_ID = 1
++
++        fun start(ctx: Context) {
++            androidx.core.content.ContextCompat.startForegroundService(
++                ctx, Intent(ctx, PulseService::class.java)
++            )
++        }
++
++        fun stop(ctx: Context) {
++            ctx.stopService(Intent(ctx, PulseService::class.java))
++        }
++    }
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
++    private var connectionJob: Job? = null
++    private var jobGeneration = -1
++    private var lastShown: String? = null
++    private lateinit var nm: NotificationManager
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onCreate() {
++        super.onCreate()
++        nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            nm.createNotificationChannel(
++                NotificationChannel(CHANNEL_ID, "Heart rate", NotificationManager.IMPORTANCE_LOW)
++                    .apply { setShowBadge(false) }
++            )
++        }
++    }
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        if (intent?.action == ACTION_STOP) {
++            stopSelf()
++            return START_NOT_STICKY
++        }
++        ServiceCompat.startForeground(
++            this, NOTIF_ID, buildNotification(PulseState.pulse.value),
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
++                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0
++        )
++        // (Re)start the connection if not running, or if another device was picked.
++        if (connectionJob?.isActive != true || jobGeneration != heartRateStream.generation) {
++            connectionJob?.cancel()
++            jobGeneration = heartRateStream.generation
++            connectionJob = scope.launch { connectionLoop() }
++        }
++        return START_NOT_STICKY
++    }
++
++    override fun onDestroy() {
++        scope.cancel()
++        PulseState.pulse.value = "---"
++        super.onDestroy()
++    }
++
++    private suspend fun connectionLoop() {
++        while (true) {
++            try {
++                coroutineScope {
++                    PulseState.pulse.value = "---"
++                    updateNotification("---")
++                    heartRateStream.heartRateFlow().collect {
++                        val p = it.pulse.toString()
++                        PulseState.pulse.value = p
++                        if (it.batteryLevel != null)
++                            PulseState.battery.value = it.batteryLevel.toString() + "%"
++                        updateNotification(p)
++                    }
++                }
++            } catch (e: Exception) {
++                if (e is CancellationException && e !is ConnectionClosedException) throw e
++                if (e !is TimeoutException) {
++                    println("Error collecting data from device: $e")
++                    e.printStackTrace()
++                }
++            }
++            println("retrying to connect")
++            delay(200)
++        }
++    }
++
++    private fun updateNotification(text: String) {
++        if (text == lastShown) return
++        lastShown = text
++        nm.notify(NOTIF_ID, buildNotification(text))
++    }
++
++    private fun buildNotification(text: String): Notification {
++        val open = PendingIntent.getActivity(
++            this, 0,
++            Intent(this, MainActivity::class.java)
++                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
++        )
++        val stop = PendingIntent.getService(
++            this, 1,
++            Intent(this, PulseService::class.java).setAction(ACTION_STOP),
++            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
++        )
++        return NotificationCompat.Builder(this, CHANNEL_ID)
++            .setSmallIcon(IconCompat.createWithBitmap(numberIcon(text)))
++            .setContentTitle(if (text == "---") "♥ Searching…" else "♥ $text bpm")
++            .setContentIntent(open)
++            .addAction(0, "Stop", stop)
++            .setOngoing(true)
++            .setOnlyAlertOnce(true)
++            .setShowWhen(false)
++            .setCategory(NotificationCompat.CATEGORY_SERVICE)
++            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
++            .build()
++    }
++
++    /** Status bar icons are monochrome: draw the number in white on transparent. */
++    private fun numberIcon(text: String): Bitmap {
++        val size = 96
++        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
++        val c = Canvas(bmp)
++        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++            color = Color.WHITE
++            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
++            textAlign = Paint.Align.CENTER
++            textSize = 80f
++        }
++        val w = paint.measureText(text)
++        if (w > size) paint.textSize = 80f * size / w
++        val y = size / 2f - (paint.descent() + paint.ascent()) / 2f
++        c.drawText(text, size / 2f, y, paint)
++        return bmp
++    }
++}
