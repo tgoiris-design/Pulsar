@@ -100,10 +100,10 @@ index a04c6cf..6fe6a38 100644
              }
 diff --git a/app/src/main/java/com/ds/pulsar/PulseService.kt b/app/src/main/java/com/ds/pulsar/PulseService.kt
 new file mode 100644
-index 0000000..c052274
+index 0000000..35be38a
 --- /dev/null
 +++ b/app/src/main/java/com/ds/pulsar/PulseService.kt
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,200 @@
 +package com.ds.pulsar
 +
 +import android.app.Notification
@@ -267,21 +267,40 @@ index 0000000..c052274
 +            .build()
 +    }
 +
-+    /** Status bar icons are monochrome: draw the number in white on transparent. */
++    /** Status bar icons are monochrome: a white heart left of the number, on transparent. */
 +    private fun numberIcon(text: String): Bitmap {
-+        val size = 96
-+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-+        val c = Canvas(bmp)
++        val h = 96
 +        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
 +            color = Color.WHITE
 +            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-+            textAlign = Paint.Align.CENTER
-+            textSize = 80f
++            textAlign = Paint.Align.LEFT
++            textSize = 74f
 +        }
-+        val w = paint.measureText(text)
-+        if (w > size) paint.textSize = 80f * size / w
-+        val y = size / 2f - (paint.descent() + paint.ascent()) / 2f
-+        c.drawText(text, size / 2f, y, paint)
++        val heartW = 62f
++        val heartH = 58f
++        val gap = 6f
++        val textW = paint.measureText(text)
++        val w = (heartW + gap + textW).toInt() + 2
++        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
++        val c = Canvas(bmp)
++
++        // heart
++        val top = (h - heartH) / 2f
++        fun x(v: Float) = v * heartW
++        fun y(v: Float) = top + v * heartH
++        val path = android.graphics.Path().apply {
++            moveTo(x(0.5f), y(0.95f))
++            cubicTo(x(0.05f), y(0.60f), x(0.00f), y(0.20f), x(0.25f), y(0.08f))
++            cubicTo(x(0.40f), y(0.00f), x(0.50f), y(0.12f), x(0.50f), y(0.25f))
++            cubicTo(x(0.50f), y(0.12f), x(0.60f), y(0.00f), x(0.75f), y(0.08f))
++            cubicTo(x(1.00f), y(0.20f), x(0.95f), y(0.60f), x(0.50f), y(0.95f))
++            close()
++        }
++        c.drawPath(path, paint)
++
++        // number
++        val ty = h / 2f - (paint.descent() + paint.ascent()) / 2f
++        c.drawText(text, heartW + gap, ty, paint)
 +        return bmp
 +    }
 +}
