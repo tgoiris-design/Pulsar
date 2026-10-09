@@ -100,10 +100,10 @@ index a04c6cf..6fe6a38 100644
              }
 diff --git a/app/src/main/java/com/ds/pulsar/PulseService.kt b/app/src/main/java/com/ds/pulsar/PulseService.kt
 new file mode 100644
-index 0000000..35be38a
+index 0000000..2940378
 --- /dev/null
 +++ b/app/src/main/java/com/ds/pulsar/PulseService.kt
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,205 @@
 +package com.ds.pulsar
 +
 +import android.app.Notification
@@ -270,14 +270,20 @@ index 0000000..35be38a
 +    /** Status bar icons are monochrome: a white heart left of the number, on transparent. */
 +    private fun numberIcon(text: String): Bitmap {
 +        val h = 96
++        val digitH = 90f // digits fill almost the full icon height, so they render large
 +        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
 +            color = Color.WHITE
-+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
++            typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
 +            textAlign = Paint.Align.LEFT
-+            textSize = 74f
++            textSize = 100f
 +        }
-+        val heartW = 62f
-+        val heartH = 58f
++        // scale the text so a digit is exactly digitH pixels tall
++        val b = android.graphics.Rect()
++        paint.getTextBounds("0", 0, 1, b)
++        paint.textSize = 100f * digitH / b.height()
++
++        val heartH = 78f
++        val heartW = 84f
 +        val gap = 6f
 +        val textW = paint.measureText(text)
 +        val w = (heartW + gap + textW).toInt() + 2
@@ -298,9 +304,8 @@ index 0000000..35be38a
 +        }
 +        c.drawPath(path, paint)
 +
-+        // number
-+        val ty = h / 2f - (paint.descent() + paint.ascent()) / 2f
-+        c.drawText(text, heartW + gap, ty, paint)
++        // number: baseline so the digits are vertically centered
++        c.drawText(text, heartW + gap, h / 2f + digitH / 2f, paint)
 +        return bmp
 +    }
 +}
